@@ -1,7 +1,11 @@
 # Revision history for `cardano-ledger-dijkstra`
 
-## 0.4.1.0
+## 0.5.0.0
 
+* Add `POOLREAP` rule for Dijkstra:
+  - Add `Cardano.Ledger.Dijkstra.Rules.PoolReap` module
+  - Change `EraRule "POOLREAP" DijkstraEra` from `Shelley.POOLREAP` to `POOLREAP`
+  - Add `EraRuleEvent "POOLREAP" DijkstraEra` type instance
 * Change `eraMaxLanguage` to `PlutusV4`
 
 ## 0.4.0.0

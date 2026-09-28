@@ -1,8 +1,9 @@
 # Version history for `cardano-ledger-shelley`
 
-## 1.20.0.1
+## 1.20.1.0
 
-*
+* Add `poolReapAssertions`
+* Export `renderPoolReapViolation`
 
 ## 1.20.0.0
 
