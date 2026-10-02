@@ -96,6 +96,7 @@ library
     base16-bytestring,
     bytestring,
     cardano-crypto-class >=2.3,
+    cardano-crypto-leios,
     cardano-data,
     cardano-ledger-allegra,
     cardano-ledger-alonzo,
@@ -125,6 +126,7 @@ library
     tree-diff,
     unliftio,
     vector-map,
+    vector,
 
   if flag(asserts)
     ghc-options: -fno-ignore-asserts
