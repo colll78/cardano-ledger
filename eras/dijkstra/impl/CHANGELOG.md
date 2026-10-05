@@ -1,8 +1,9 @@
 # Revision history for `cardano-ledger-dijkstra`
 
-## 0.4.1.0
+## 0.5.0.0
 
 * Change `eraMaxLanguage` to `PlutusV4`
+* Rename `requiredTopLevelGuardsL` to `requiredTopLevelGuardsTxBodyL`
 
 ## 0.4.0.0
 
