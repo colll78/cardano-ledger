@@ -2,6 +2,9 @@
 
 ## 0.4.1.0
 
+* Add `getDijkstraSupplementalDataHashes` and use it for `getSupplementalDataHashes`, so that,
+  outside legacy mode, a top-level transaction can supply datums for the outputs and reference
+  inputs of its sub-transactions
 * Change `eraMaxLanguage` to `PlutusV4`
 
 ## 0.4.0.0
