@@ -52,7 +52,7 @@ import Cardano.Ledger.Conway.Governance (
 import qualified Cardano.Ledger.Conway.Rules as Conway
 import Cardano.Ledger.Conway.TxCert
 import Cardano.Ledger.Credential
-import Cardano.Ledger.Dijkstra (ApplyTxError, DijkstraEra)
+import Cardano.Ledger.Dijkstra (ApplyTxError, DijkstraEra, DijkstraEraForecast)
 import Cardano.Ledger.Dijkstra.BlockBody (DijkstraEraBlockBody)
 import Cardano.Ledger.Dijkstra.Core
 import Cardano.Ledger.Dijkstra.Rules
@@ -128,6 +128,7 @@ instance ConwayEraImp DijkstraEra
 class
   ( ConwayEraImp era
   , DijkstraEraTest era
+  , DijkstraEraForecast era
   , DijkstraEraBlockBody era
   , InjectRuleFailure "BBODY" DijkstraBbodyPredFailure era
   , InjectRuleFailure "LEDGER" DijkstraLedgerPredFailure era
