@@ -1,8 +1,9 @@
 # Version history for `cardano-ledger-conway`
 
-## 1.24.0.1
+## 1.25.0.0
 
-*
+* Add `UnsupportedOutputAddresses` to `ConwayUtxoPredFailure` and preserve it when converting earlier-era failures
+* Preserve protected-address staking credentials in stake accounting
 
 ## 1.24.0.0
 

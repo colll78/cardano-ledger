@@ -1,7 +1,12 @@
 # Revision history for `cardano-ledger-dijkstra`
 
-## 0.4.1.0
+## 0.5.0.0
 
+* Add `DijkstraReceiving` with redeemer tag 7 and canonical protected-output target sets
+* Require body-local key, native-script and Plutus witnesses for protected outputs
+* Translate protected addresses and Receiving purposes into the receiving-aware Plutus V4 context
+* Add `UnsupportedOutputAddresses`, `ProtectedCollateralReturn` and `SubUnsupportedOutputAddresses` predicate failures
+* Add `evalDijkstraTxExUnits` and `evalDijkstraTxExUnitsWithLogs` for body-local batch redeemer reports
 * Change `eraMaxLanguage` to `PlutusV4`
 
 ## 0.4.0.0

@@ -1,8 +1,10 @@
 # Version history for `cardano-ledger-shelley`
 
-## 1.20.0.1
+## 1.21.0.0
 
-*
+* Add `UnsupportedOutputAddresses` to `ShelleyUtxoPredFailure` and export `validateSupportedAddresses`
+* Preserve protected-address payment and stake credentials in witness collection and stake accounting
+* Reject protected addresses in production initial-fund injection
 
 ## 1.20.0.0
 
