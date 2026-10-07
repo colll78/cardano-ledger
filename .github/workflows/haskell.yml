@@ -562,20 +562,32 @@ jobs:
     - uses: actions/checkout@v7
     - name: Check formal-ledger-specifications SRP commit hash
       run: |
-        TAG=$(sed -ne \
-          '/ *location: *https:\/\/github.com\/IntersectMBO\/formal-ledger-specifications.git/,/tag:/ p' \
-          cabal.project \
-        | sed -ne 's/^ *tag: *//p')
-        if [ -z "$TAG" ]; then
-          echo "Error: IntersectMBO/formal-ledger-specifications SRP tag not found."
+        LOCATION=$(awk '
+          /^source-repository-package/ { location = "" }
+          /^ *location:/ { location = $2 }
+          /^ *tag:/ && location ~ /\/formal-ledger-specifications\.git$/ { print location; exit }
+        ' cabal.project)
+        TAG=$(awk '
+          /^source-repository-package/ { location = "" }
+          /^ *location:/ { location = $2 }
+          /^ *tag:/ && location ~ /\/formal-ledger-specifications\.git$/ { print $2; exit }
+        ' cabal.project)
+        if [ -z "$LOCATION" ] || [ -z "$TAG" ]; then
+          echo "Error: formal-ledger-specifications SRP location/tag not found."
           exit 1
         fi
-        git fetch https://github.com/intersectmbo/formal-ledger-specifications.git master-artifacts
-
-        git show -s "$TAG" || { \
-          echo "Commit $TAG was not found on the master-artifacts branch of formal-ledger-specifications."
+        case "$LOCATION" in
+          https://github.com/colll78/formal-ledger-specifications.git)
+            ARTIFACTS_BRANCH=codex/cip-160-receiving-artifacts ;;
+          https://github.com/IntersectMBO/formal-ledger-specifications.git)
+            ARTIFACTS_BRANCH=master-artifacts ;;
+          *) echo "Error: unexpected formal-ledger-specifications repository: $LOCATION"; exit 1 ;;
+        esac
+        git fetch "$LOCATION" "$ARTIFACTS_BRANCH"
+        if ! git cat-file -e "$TAG^{commit}" || ! git merge-base --is-ancestor "$TAG" FETCH_HEAD; then
+          echo "Commit $TAG is not reachable from $LOCATION $ARTIFACTS_BRANCH."
           exit 1
-        }
+        fi
   undefined-check:
     name: Check that there are no additions of `undefined`s in the PR diff
     runs-on: ubuntu-latest
