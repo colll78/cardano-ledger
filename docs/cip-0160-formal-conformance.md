@@ -4,7 +4,7 @@ The ledger pins development artifact
 [`b747be78f6e001d41395974251cf0b42f45b68c4`](https://github.com/colll78/formal-ledger-specifications/tree/b747be78f6e001d41395974251cf0b42f45b68c4),
 genuinely extracted from signed source
 [`87072fed43a085bbbaaeb5888a7792ec5f8a164a`](https://github.com/colll78/formal-ledger-specifications/commit/87072fed43a085bbbaaeb5888a7792ec5f8a164a)
-in [formal source PR 1348](https://github.com/IntersectMBO/formal-ledger-specifications/pull/1348).
+in [formal source proposal](https://github.com/colll78/formal-ledger-specifications/pull/1).
 That source includes upstream master through
 `f4f95d3349a26c8bfcc483dda58fbfab80e3d85c`. Cabal and Nix consume the same
 artifact revision. Its 789 generated files have SHA-256 manifest
@@ -20,8 +20,9 @@ artifact CI workflow runs these regressions before upload. The committee checks
 include four composed epoch cases requiring one seat per pool when several
 credentials delegate to that pool, including an exact top-K boundary.
 Integrated comparison coverage and current validation evidence are described
-below. Upstream source acceptance and artifact ancestry remain required by the
-existing ledger CI gate.
+below. Fork CI validates the artifact pin against its allowed declared artifact branch.
+Upstream source acceptance and accepted artifact ancestry remain release
+requirements; successful fork provenance validation does not establish them.
 
 `BaseAddr.protected` is part of address equality. Bootstrap addresses have no
 protection flag. `protect` preserves the payment and staking credentials by
@@ -125,12 +126,14 @@ returns textual errors and accepts either system's rejection. Pure
 wire, payload and evaluator checks described above.
 
 A local path to extracted `dist/hs` is a development dependency only.
-`.github/workflows/haskell.yml` checks that the formal artifact dependency is an
-ancestor of upstream `master-artifacts`. An unmerged fork artifact cannot satisfy
-that enforced release condition. Source review/typecheck, generated artifact
-hashes, conformance results and the upstream source/artifact merge references
-must all be attached to the release input; a local pass does not remove the
-external merge requirement.
+The [fork-base workflow at `f721f947`](https://github.com/colll78/cardano-ledger/blob/f721f94744e7d3bfda8384e42f2dd031a41c4284/.github/workflows/haskell.yml)
+checks that the declared formal artifact pin exists and is an ancestor of the
+allowed declared artifact branch; unknown
+repositories fail. Our fork artifact can satisfy that provenance check without
+establishing upstream acceptance. Source review/typecheck, generated artifact
+hashes, conformance results and accepted upstream source/artifact references
+must all be attached to an upstream release input; a fork or local pass does
+not remove that external acceptance requirement.
 
 ## Integrated validation
 
@@ -147,7 +150,7 @@ duplicate-output budget comparison. Those compare the independently extracted
 model under the premises below. The model's persistent runtime assertions and
 integrated ledger comparisons are separate evidence: the former do not imply
 that the complete ledger conformance suite passes. Current run outcomes and
-validation receipts are tracked in [formal source PR 1348](https://github.com/IntersectMBO/formal-ledger-specifications/pull/1348).
+validation receipts are tracked in [formal source proposal](https://github.com/colll78/formal-ledger-specifications/pull/1).
 
 Reproduce from `libs/cardano-ledger-conformance` by running its built `tests`
 executable with `--seed=2023 +RTS -N2 -RTS`; a focused selection additionally
