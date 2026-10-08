@@ -25,10 +25,12 @@ module Cardano.Ledger.Dijkstra.TxInfo (
   DijkstraContextError (..),
   guardDijkstraFeaturesForPlutusV1toV3,
   transFailUnsupportedScriptInSubTx,
+  transTxRedeemersV4,
   transValidityInterval,
 ) where
 
 import Cardano.Crypto.Hash.Class (hashToBytes)
+import Cardano.Ledger.Address (AddressProtection (..), shelleyAddressView)
 import Cardano.Ledger.Alonzo.Plutus.Context (
   EraPlutusContext (..),
   EraPlutusTxInfo (..),
@@ -42,6 +44,7 @@ import Cardano.Ledger.Alonzo.Plutus.Context (
  )
 import qualified Cardano.Ledger.Alonzo.Plutus.TxInfo as Alonzo
 import Cardano.Ledger.Alonzo.Scripts (toAsItem, toAsIx)
+import Cardano.Ledger.Alonzo.TxWits (unRedeemersL)
 import Cardano.Ledger.Alonzo.UTxO (AlonzoEraUTxO (..))
 import qualified Cardano.Ledger.Babbage.TxInfo as Babbage
 import Cardano.Ledger.BaseTypes (
@@ -96,6 +99,7 @@ import Cardano.Ledger.Dijkstra.Scripts (
   DijkstraEraScript,
   PlutusScript (..),
  )
+import Cardano.Ledger.Dijkstra.TxBody (receivingScriptTargets)
 import Cardano.Ledger.Dijkstra.TxCert (DijkstraTxCert)
 import Cardano.Ledger.Dijkstra.UTxO ()
 import Cardano.Ledger.Mary.Value (MaryValue, filterMultiAsset)
@@ -125,13 +129,13 @@ import Cardano.Ledger.Plutus (
  )
 import Cardano.Ledger.Plutus.Data (Data)
 import Cardano.Ledger.Plutus.ToPlutusData (ToPlutusData (..))
-import Cardano.Ledger.State (StakePoolParams (..), UTxO)
+import Cardano.Ledger.State (StakePoolParams (..), UTxO (..))
 import Cardano.Ledger.TxIn (TxId, TxIn (..), txIdToHex)
 import Cardano.Slotting.EpochInfo (EpochInfo)
 import Cardano.Slotting.Time (SystemStart)
 import Control.Arrow (left)
 import Control.DeepSeq (NFData)
-import Control.Monad (forM, unless, zipWithM)
+import Control.Monad (forM, unless, zipWithM, zipWithM_)
 import Data.Aeson (KeyValue (..), ToJSON (..))
 import Data.Foldable (Foldable (..))
 import qualified Data.Foldable as F
@@ -143,6 +147,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
 import qualified Data.OMap.Strict as OMap
 import Data.Proxy (Proxy (..))
+import qualified Data.Sequence.Strict as StrictSeq
 import qualified Data.Set as Set
 import Data.Text (Text)
 import GHC.Generics (Generic)
@@ -168,6 +173,8 @@ data DijkstraContextError era
     GuardScriptHashesNotSupported (NonEmpty ScriptHash)
   | -- | Attempt to use PlutusV1-V3 with non-empty required top-level guards will result in this failure
     RequiredTopLevelGuardsNotSupported (NonEmptyMap (Credential Guard) (StrictMaybe (Data era)))
+  | -- | A protected address cannot be represented in a PlutusV1-V3 context.
+    ProtectedAddressNotSupported TxOutSource
   | -- | Attempt to use PlutusV4 script with an invalid redeemer pointer will result in this failure
     ScriptHashNotFoundForPurpose (PlutusPurpose AsIx era)
   deriving (Generic)
@@ -237,6 +244,8 @@ instance
       kindObjectValue "GuardScriptHashesNotSupported" ["script_hashes" .= toJSON scriptHashes]
     RequiredTopLevelGuardsNotSupported rtlg ->
       kindObjectValue "RequiredTopLevelGuardsNotSupported" ["required_top_level_guards" .= show rtlg]
+    ProtectedAddressNotSupported source ->
+      kindObjectValue "ProtectedAddressNotSupported" ["txOut" .= toJSON source]
     ScriptHashNotFoundForPurpose purpose ->
       kindObjectValue "ScriptHashNotFoundForPurpose" ["purpose" .= toJSON purpose]
 
@@ -260,6 +269,7 @@ instance
     22 -> SumD GuardScriptHashesNotSupported <! From
     23 -> SumD RequiredTopLevelGuardsNotSupported <! From
     24 -> SumD ScriptHashNotFoundForPurpose <! From
+    25 -> SumD ProtectedAddressNotSupported <! From
     k -> Invalid k
 
 instance
@@ -286,6 +296,8 @@ instance
         Sum RequiredTopLevelGuardsNotSupported 23 !> To rtlg
       ScriptHashNotFoundForPurpose purpose ->
         Sum ScriptHashNotFoundForPurpose 24 !> To purpose
+      ProtectedAddressNotSupported source ->
+        Sum ProtectedAddressNotSupported 25 !> To source
 
 instance Inject (ConwayContextError era) (DijkstraContextError era) where
   inject = ConwayContextError
@@ -340,9 +352,10 @@ instance EraPlutusTxInfo 'PlutusV1 DijkstraEra where
       let txBody = tx ^. bodyTxL
       Conway.guardConwayFeaturesForPlutusV1V2 tx
       guardDijkstraFeaturesForPlutusV1toV3 tx
+      guardLegacyProtectedAddresses PlutusV1 ltiUTxO tx
       timeRange <- Conway.transValidityInterval tx ltiEpochInfo ltiSystemStart (txBody ^. vldtTxBodyL)
       inputs <- mapM (Conway.transTxInInfoV1 ltiUTxO) (Set.toList (txBody ^. inputsTxBodyL))
-      mapM_ (Conway.transTxInInfoV1 ltiUTxO) (Set.toList (txBody ^. referenceInputsTxBodyL))
+      mapM_ (validateV1ReferenceInput ltiUTxO) (Set.toList (txBody ^. referenceInputsTxBodyL))
       outputs <-
         zipWithM
           (Conway.transTxOutV1 . TxOutFromOutput)
@@ -399,6 +412,7 @@ instance EraPlutusTxInfo 'PlutusV2 DijkstraEra where
       let txBody = tx ^. bodyTxL
       Conway.guardConwayFeaturesForPlutusV1V2 tx
       guardDijkstraFeaturesForPlutusV1toV3 tx
+      guardLegacyProtectedAddresses PlutusV2 ltiUTxO tx
       timeRange <-
         Conway.transValidityInterval tx ltiEpochInfo ltiSystemStart (txBody ^. vldtTxBodyL)
       inputs <- mapM (Babbage.transTxInInfoV2 ltiUTxO) (Set.toList (txBody ^. inputsTxBodyL))
@@ -442,6 +456,7 @@ instance EraPlutusTxInfo 'PlutusV3 DijkstraEra where
         txInputs = txBody ^. inputsTxBodyL
         refInputs = txBody ^. referenceInputsTxBodyL
       guardDijkstraFeaturesForPlutusV1toV3 tx
+      guardLegacyProtectedAddresses PlutusV3 ltiUTxO tx
       timeRange <-
         Conway.transValidityInterval tx ltiEpochInfo ltiSystemStart (txBody ^. vldtTxBodyL)
       inputsInfo <- mapM (Conway.transTxInInfoV3 ltiUTxO) (Set.toList txInputs)
@@ -517,6 +532,55 @@ guardDijkstraFeaturesForPlutusV1toV3 tx = do
       Left $
         inject $
           GuardScriptHashesNotSupported @era neScriptHashes
+
+-- | Inspect only addresses visible to this legacy context. V1 hides reference inputs;
+-- sibling bodies are not visible to any of these contexts.
+guardLegacyProtectedAddresses ::
+  forall era.
+  ( EraTx era
+  , BabbageEraTxBody era
+  , Inject (DijkstraContextError era) (ContextError era)
+  ) =>
+  Language ->
+  UTxO era ->
+  Tx TopTx era ->
+  Either (ContextError era) ()
+guardLegacyProtectedAddresses language utxo tx = do
+  let body = tx ^. bodyTxL
+      referenceInputs = case language of
+        PlutusV1 -> mempty
+        _ -> body ^. referenceInputsTxBodyL
+      check source output =
+        case shelleyAddressView (output ^. addrTxOutL) of
+          Just (Protected, _, _, _) -> Left . inject $ ProtectedAddressNotSupported @era source
+          _ -> Right ()
+      -- Missing-input errors remain owned by the language's existing translation,
+      -- preserving historical error order when protection is absent.
+      checkInput input = case Map.lookup input (unUTxO utxo) of
+        Nothing -> Right ()
+        Just output -> check (TxOutFromInput input) output
+  mapM_ checkInput . Set.toList $ (body ^. inputsTxBodyL) <> referenceInputs
+  zipWithM_ check (map TxOutFromOutput [minBound ..]) (F.toList (body ^. outputsTxBodyL))
+
+-- | Preserve V1's existing validation of hidden reference inputs without translating
+-- their addresses. In particular, protection is not erased into a legacy context.
+validateV1ReferenceInput ::
+  forall era.
+  ( BabbageEraTxOut era
+  , Inject (Alonzo.AlonzoContextError era) (ContextError era)
+  , Inject (Babbage.BabbageContextError era) (ContextError era)
+  ) =>
+  UTxO era ->
+  TxIn ->
+  Either (ContextError era) ()
+validateV1ReferenceInput utxo input = do
+  output <- Alonzo.transLookupTxOut utxo input
+  case output ^. dataTxOutL of
+    SJust _ -> Left . inject $ Babbage.InlineDatumsNotSupported @era (TxOutFromInput input)
+    SNothing -> pure ()
+  case output ^. addrTxOutL of
+    AddrBootstrap _ -> Left . inject $ Babbage.ByronTxOutInContext @era (TxOutFromInput input)
+    _ -> pure ()
 
 transFailUnsupportedScriptInSubTx ::
   forall l era.
@@ -594,7 +658,7 @@ instance EraPlutusTxInfo 'PlutusV4 DijkstraEra where
           [minBound ..]
           (F.toList (txBody ^. outputsTxBodyL))
       txCerts <- Alonzo.transTxBodyCerts proxy ltiProtVer txBody
-      plutusRedeemers <- Babbage.transTxRedeemers proxy lti
+      plutusRedeemers <- transTxRedeemersV4 lti
       Right
         PV4.TxInfo
           { PV4.txInfoInputs = inputsInfo
@@ -627,6 +691,34 @@ instance EraPlutusTxInfo 'PlutusV4 DijkstraEra where
   toPlutusArgs = toPlutusV4Args
 
   toPlutusTxInInfo _ = transTxInInfoV4
+
+-- | Translate V4 redeemers, sharing the complete body-local Receiving target
+-- domain across all Receiving pointers. Native and unavailable script hashes
+-- retain their original output positions even though they need not have a redeemer.
+-- Other purposes retain the existing pointer translation and error ordering.
+transTxRedeemersV4 ::
+  ( DijkstraEraScript era
+  , EraPlutusTxInfo PlutusV4 era
+  , EraTx era
+  , AlonzoEraTxBody era
+  , AlonzoEraTxWits era
+  , Inject (Babbage.BabbageContextError era) (ContextError era)
+  ) =>
+  LedgerTxInfo level era ->
+  Either (ContextError era) (PV4.Map PV4.ScriptPurpose PV4.Redeemer)
+transTxRedeemersV4 lti@LedgerTxInfo {ltiTx} =
+  PV4.unsafeFromList
+    <$> mapM translate (Map.toList $ ltiTx ^. witsTxL . rdmrsTxWitsL . unRedeemersL)
+  where
+    targets =
+      Map.fromDistinctAscList (receivingScriptTargets (ltiTx ^. bodyTxL))
+    translate pair@(ptr, (datum, _)) = case ptr of
+      ReceivingPurpose (AsIx ix) -> case Map.lookup ix targets of
+        Nothing -> Left $ inject $ Babbage.RedeemerPointerPointsToNothing ptr
+        Just _ -> do
+          purpose <- toPlutusScriptPurpose SPlutusV4 lti (ReceivingPurpose (AsIxItem ix ix))
+          pure (purpose, Babbage.transRedeemer datum)
+      _ -> Babbage.transRedeemerPointerV2V3 SPlutusV4 lti pair
 
 transTxInV4 :: TxIn -> PV4.TxOutRef
 transTxInV4 (TxIn txid txIx) = PV4.TxOutRef (Conway.transTxId txid) (toInteger (txIxToInt txIx))
@@ -674,13 +766,16 @@ transTxOutV4 txOutSource txOut = do
             $ binaryData
 
   addr <-
-    case txOut ^. addrTxOutL of
-      Addr _ pCred stakeRef ->
-        PV4.Address (transCred pCred) <$> case stakeRef of
-          StakeRefBase sCred -> Right . Just $ transCredToAccountId sCred
-          StakeRefNull -> Right Nothing
-          StakeRefPtr _ -> Left . inject $ PointerPresentInOutput @era txOutSource
-      AddrBootstrap _ -> Left . inject $ Babbage.ByronTxOutInContext @era txOutSource
+    case shelleyAddressView (txOut ^. addrTxOutL) of
+      Just (protection, _, pCred, stakeRef) ->
+        let addressConstructor = case protection of
+              Unprotected -> PV4.Address
+              Protected -> PV4.AddressProtected
+         in addressConstructor (transCred pCred) <$> case stakeRef of
+              StakeRefBase sCred -> Right . Just $ transCredToAccountId sCred
+              StakeRefNull -> Right Nothing
+              StakeRefPtr _ -> Left . inject $ PointerPresentInOutput @era txOutSource
+      Nothing -> Left . inject $ Babbage.ByronTxOutInContext @era txOutSource
   pure $
     PV4.TxOut
       { txOutReferenceScript = referenceScript
@@ -774,12 +869,15 @@ scriptPurposeToScriptInfo ::
   forall proxy (l :: Language) level era.
   ( EraTx era
   , AlonzoEraTxWits era
+  , DijkstraEraScript era
   , DijkstraEraTxBody era
+  , Value era ~ MaryValue
   , EraPlutusTxInfo l era
   , PlutusTxInfo l ~ PV4.TxInfo
   , STxLevel level era ~ STxBothLevels level era
   , Inject (DijkstraContextError era) (ContextError era)
   , Inject (Alonzo.AlonzoContextError era) (ContextError era)
+  , Inject (Babbage.BabbageContextError era) (ContextError era)
   ) =>
   proxy l ->
   Maybe PV4.Datum ->
@@ -795,6 +893,15 @@ scriptPurposeToScriptInfo proxy datum lti txInfo ixPlutusPurpose = \case
   PV4.Certifying _ ix cert -> pure (PV4.CertifyingScript ix cert)
   PV4.Voting _ vote -> pure (PV4.VotingScript vote)
   PV4.Proposing _ ix proposal -> pure (PV4.ProposingScript ix proposal)
+  PV4.Receiving _ outputIndex -> case ixPlutusPurpose of
+    ReceivingPurpose (AsIx ix)
+      | outputIndex == toInteger ix ->
+          case StrictSeq.lookup (fromIntegral ix) (ltiTx lti ^. bodyTxL . outputsTxBodyL) of
+            Nothing -> Left $ inject $ ScriptHashNotFoundForPurpose ixPlutusPurpose
+            Just txOut ->
+              PV4.ReceivingScript outputIndex
+                <$> transTxOutV4 (TxOutFromOutput $ TxIx $ fromIntegral ix) txOut
+    _ -> Left $ inject $ ScriptHashNotFoundForPurpose ixPlutusPurpose
   PV4.Guarding _ ix -> do
     guardingScriptHash <- case Map.lookup ixPlutusPurpose (ltiScriptHashesUsed lti) of
       Nothing -> Left $ inject $ ScriptHashNotFoundForPurpose ixPlutusPurpose
@@ -815,6 +922,7 @@ scriptHashFromScriptPurpose = \case
   PV4.Voting sh _ -> sh
   PV4.Proposing sh _ _ -> sh
   PV4.Guarding sh _ -> sh
+  PV4.Receiving sh _ -> sh
 
 transGuardingTopTxInfo ::
   forall proxy (l :: Language) era.
@@ -927,11 +1035,14 @@ transGuardingTopTxInfo proxy txInfo guardingScriptHash lti@(LedgerTxInfo {ltiTx,
 toPlutusV4Args ::
   ( AlonzoEraUTxO era
   , AlonzoEraTxWits era
+  , DijkstraEraScript era
   , DijkstraEraTxBody era
+  , Value era ~ MaryValue
   , EraPlutusTxInfo PlutusV4 era
   , STxLevel level era ~ STxBothLevels level era
   , Inject (DijkstraContextError era) (ContextError era)
   , Inject (Alonzo.AlonzoContextError era) (ContextError era)
+  , Inject (Babbage.BabbageContextError era) (ContextError era)
   ) =>
   proxy 'PlutusV4 ->
   LedgerTxInfo level era ->
@@ -986,6 +1097,7 @@ transPlutusPurposeV4 proxy lti plutusPurpose = do
     ProposingPurpose (AsIxItem ix proc) ->
       pure $ PV4.Proposing sh (toInteger ix) (transProposal proxy proc)
     GuardingPurpose (AsIxItem ix _) -> pure $ PV4.Guarding sh (toInteger ix)
+    ReceivingPurpose (AsIxItem _ outputIx) -> pure $ PV4.Receiving sh (toInteger outputIx)
     _ ->
       Left $ inject $ Alonzo.PlutusPurposeNotSupported @era $ hoistPlutusPurpose toAsItem plutusPurpose
 

@@ -36,6 +36,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.OMap.Strict as OMap
 import qualified Data.Sequence.Strict as StrictSeq
 import qualified Data.Set as Set
+import qualified Data.Set.NonEmpty as NES
 import Data.Typeable (Typeable)
 import Lens.Micro
 import Test.Cardano.Ledger.Core.Utils (txInAt)
@@ -62,6 +63,57 @@ spec = describe "UTXO" $ do
           mkBasicTx mkBasicTxBody
             & bodyTxL . collateralReturnTxBodyL .~ SJust ptrOutput
       submitFailingTx tx [injectFailure $ PtrPresentInCollateralReturn ptrOutput]
+
+  describe "CIP-160 phase-1 address rejection" $ do
+    disableInConformanceIt
+      "[outside model: stake pointers] rejects an internally constructed protected pointer ordinary output"
+      $ do
+        payment <- KeyHashObj <$> freshKeyHash
+        ptr <- arbitrary
+        pp <- getsPParams id
+        let out =
+              ensureMinCoinTxOut pp $
+                mkBasicTxOut (AddrProtected Testnet payment (StakeRefPtr ptr)) (inject (Coin 100))
+            tx = mkBasicTx mkBasicTxBody & bodyTxL . outputsTxBodyL .~ [out]
+        submitFailingTx tx [injectFailure $ UnsupportedOutputAddresses (NES.singleton 0)]
+    it "rejects a protected collateral return in a script-free transaction" $ do
+      payment <- KeyHashObj <$> freshKeyHash
+      pp <- getsPParams id
+      let out =
+            ensureMinCoinTxOut pp $
+              mkBasicTxOut (AddrProtected Testnet payment StakeRefNull) (inject (Coin 100))
+          tx = mkBasicTx mkBasicTxBody & bodyTxL . collateralReturnTxBodyL .~ SJust out
+      fixed <- fixupTx tx
+      beforeUtxo <- getUTxO
+      withNoFixup $ submitFailingTx fixed [injectFailure ProtectedCollateralReturn]
+      getUTxO >>= (`shouldBe` beforeUtxo)
+    it "rejects a protected collateral return even when its Plutus script succeeds" $ do
+      payment <- KeyHashObj <$> freshKeyHash
+      pp <- getsPParams id
+      let out =
+            ensureMinCoinTxOut pp $
+              mkBasicTxOut (AddrProtected Testnet payment StakeRefNull) (inject (Coin 100))
+          tx = mkBasicTx mkBasicTxBody & bodyTxL . collateralReturnTxBodyL .~ SJust out
+      successfulTx <- switchTxToLegacyMode tx
+      fixed <- fixupTx successfulTx
+      beforeUtxo <- getUTxO
+      withNoFixup $ submitFailingTx fixed [injectFailure ProtectedCollateralReturn]
+      getUTxO >>= (`shouldBe` beforeUtxo)
+    it "rejects a protected collateral return when a failing script is claimed phase-2 invalid" $ do
+      payment <- KeyHashObj <$> freshKeyHash
+      pp <- getsPParams id
+      let out =
+            ensureMinCoinTxOut pp $
+              mkBasicTxOut (AddrProtected Testnet payment StakeRefNull) (inject (Coin 100))
+          tx = mkBasicTx mkBasicTxBody & bodyTxL . collateralReturnTxBodyL .~ SJust out
+      failingTx <- switchTxToPhase2InvalidLegacyMode tx
+      fixed <- fixupTx failingTx
+      beforeUtxo <- getUTxO
+      withNoFixup $
+        submitFailingTx
+          (fixed & isPhase2ValidTxL .~ Phase2Invalid)
+          [injectFailure ProtectedCollateralReturn]
+      getUTxO >>= (`shouldBe` beforeUtxo)
 
   describe "value produced by a transaction" $ do
     it "counts each new pool deposit at most once across the batch" $ do

@@ -9,7 +9,11 @@
 
 module Test.Cardano.Ledger.Conformance.SpecTranslate.Dijkstra.Epoch () where
 
+import Cardano.Crypto.DSIGN (verifyPossessionProofDSIGN)
+import Cardano.Crypto.DSIGN.BLS12381 (minSigPoPDST)
+import Cardano.Crypto.Util (bytesToNatural)
 import Cardano.Ledger.BaseTypes
+import Cardano.Ledger.Binary (FixedSizeCodec (..))
 import Cardano.Ledger.Coin
 import Cardano.Ledger.Conway.Core
 import Cardano.Ledger.Conway.Governance
@@ -17,12 +21,18 @@ import Cardano.Ledger.Conway.State
 import Cardano.Ledger.Dijkstra (DijkstraEra)
 import Cardano.Ledger.Rewards (rewardAmount)
 import Cardano.Ledger.Shelley.LedgerState
+import Control.Monad.Except (throwError)
 import Data.Foldable (Foldable (..))
+import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
+import Data.Ord (Down (..))
+import qualified Data.Text as Text
 import qualified Data.VMap as VMap
+import Data.Word (Word16)
 import Lens.Micro
 import qualified MAlonzo.Code.Ledger.Dijkstra.Foreign.API as Agda
 import Test.Cardano.Ledger.Conformance.SpecTranslate.Base (
+  SpecTransM,
   SpecTranslate (..),
   askSpecTransM,
   toSpecRepMap,
@@ -33,6 +43,39 @@ import Test.Cardano.Ledger.Conformance.SpecTranslate.Dijkstra.GovCert ()
 import Test.Cardano.Ledger.Conformance.SpecTranslate.Dijkstra.Ledger ()
 import Test.Cardano.Ledger.Conformance.SpecTranslate.Dijkstra.Pool ()
 import Test.Cardano.Ledger.Shelley.Utils (runShelleyBase)
+
+-- | Recover identities from the retained selection snapshot, independently of
+-- seat keys (which can be absent or shared by several pools). The stored seat
+-- count is the retained selection bound: SetSnapShot does not retain the old
+-- committee-size parameter. Validate every weight and honoured key before
+-- attaching the independently ranked pool identity.
+translateLeiosCommittee ::
+  EpochNo -> EpochInterval -> SetSnapShot -> SpecTransM DijkstraEra () [Agda.LeiosSeat]
+translateLeiosCommittee epoch maxKeyAge SetSnapShot {ssSnapShot, ssLeiosCommittee = UnsafeLeiosCommittee seats}
+  | length seats > length rankedPools || length seats > fromIntegral (maxBound :: Word16) =
+      throwError $ Text.pack "Leios committee has more seats than its selection snapshot permits"
+  | otherwise = traverse translateSeat $ zip (toList seats) rankedPools
+  where
+    rankedPools =
+      sortOn (\(poolId, pool) -> (Down (spssStake pool), poolId)) $
+        VMap.toAscList (ssStakePoolsSnapShot ssSnapShot)
+    translateSeat (LeiosSeat {seatWeight, seatVKey}, (poolId, pool))
+      | seatWeight /= spssStakeRatio pool || seatVKey /= honouredKey pool =
+          throwError $ Text.pack "Leios committee seat disagrees with its ranked selection snapshot"
+      | otherwise = do
+          modelPoolId <- toSpecRep poolId
+          pure $
+            Agda.MkLeiosSeat
+              modelPoolId
+              seatWeight
+              (toInteger . bytesToNatural . rawEncodeFixedSized <$> strictMaybeToMaybe seatVKey)
+    honouredKey pool = do
+      BlsKeyState {bksKey = BlsKey {blsPubKey, blsPossessionProof}, bksRegisteredIn} <- spssBlsKey pool
+      if epoch < addEpochInterval bksRegisteredIn maxKeyAge
+        then case verifyPossessionProofDSIGN minSigPoPDST blsPubKey blsPossessionProof of
+          Left _ -> SNothing
+          Right () -> SJust blsPubKey
+        else SNothing
 
 instance SpecTranslate DijkstraEra (EpochState DijkstraEra) where
   type SpecRep DijkstraEra (EpochState DijkstraEra) = Agda.EpochState
@@ -75,16 +118,17 @@ instance SpecTranslate DijkstraEra SnapShot where
       activeStakeMap = VMap.toMap $ unActiveStake ssActiveStake
 
 instance SpecTranslate DijkstraEra StakePoolSnapShot where
-  type SpecRep DijkstraEra StakePoolSnapShot = Agda.StakePoolParams
+  type SpecRep DijkstraEra StakePoolSnapShot = Agda.StakePoolState
 
   toSpecRep StakePoolSnapShot {..} =
-    Agda.StakePoolParams
+    Agda.StakePoolState
       <$> toSpecRep spssSelfDelegatedOwners
       <*> toSpecRep spssCost
       <*> toSpecRep spssMargin
       <*> toSpecRep spssPledge
       <*> (Agda.RewardAddress <$> pure 0 <*> toSpecRep (unAccountId spssAccountId))
       <*> toSpecRep spssVrf
+      <*> toSpecRep spssBlsKey
 
 instance SpecTranslate DijkstraEra Stake where
   type SpecRep DijkstraEra Stake = Agda.HSMap Agda.Credential Agda.Coin
@@ -120,9 +164,11 @@ instance SpecTranslate DijkstraEra PulsingRewUpdate where
 instance SpecTranslate DijkstraEra (NewEpochState DijkstraEra) where
   type SpecRep DijkstraEra (NewEpochState DijkstraEra) = Agda.NewEpochState
 
-  type SpecContext DijkstraEra (NewEpochState DijkstraEra) = Network
+  type SpecContext DijkstraEra (NewEpochState DijkstraEra) = (Network, EpochInterval)
   toSpecRep nes@(NewEpochState {..}) = do
-    netId <- askSpecTransM
+    (netId, maxKeyAge) <- askSpecTransM
+    committee <-
+      withCtxSpecTransM () $ translateLeiosCommittee nesEL maxKeyAge (ssStakeSet (esSnapshots nesEs))
     withCtxSpecTransM () $
       Agda.MkNewEpochState
         <$> toSpecRep nesEL
@@ -131,6 +177,7 @@ instance SpecTranslate DijkstraEra (NewEpochState DijkstraEra) where
         <*> withCtxSpecTransM netId (toSpecRep nesEs)
         <*> toSpecRep nesRu
         <*> (filterZeroEntries <$> toSpecRep (nes ^. nesStakePoolDistrG))
+        <*> pure committee
     where
       filterZeroEntries (Agda.MkHSMap lst) =
         Agda.MkHSMap $ filter ((/= 0) . snd) lst

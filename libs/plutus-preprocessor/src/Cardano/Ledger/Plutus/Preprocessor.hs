@@ -239,4 +239,20 @@ allTestScripts =
         PlutusV4 -> Just V4.inputsOverlapsWithRefInputsBytes
     , "Script that succeeds only if any the inputs also appears in the reference inputs" :| []
     )
+  ,
+    ( "receivingEvenDatum"
+    , \case
+        PlutusV4 -> Just V4.receivingEvenDatumBytes
+        _ -> Nothing
+    , "V4 validator that checks its resolved Receiving output for an even inline datum."
+        :| ["Also supports Spending with an even datum; all other purposes fail."]
+    )
+  ,
+    ( "receivingRedeemerMatchesDatum"
+    , \case
+        PlutusV4 -> Just V4.receivingRedeemerMatchesDatumBytes
+        _ -> Nothing
+    , "V4 Receiving validator that matches its own redeemer to its inline integer datum."
+        :| ["Checks the original body output index and protected recipient; other purposes fail."]
+    )
   ]

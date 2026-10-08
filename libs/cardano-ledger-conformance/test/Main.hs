@@ -5,6 +5,8 @@ import qualified Test.Cardano.Ledger.Conformance.Imp.Conway as ImpConway
 import qualified Test.Cardano.Ledger.Conformance.Imp.Dijkstra as ImpDijkstra
 import qualified Test.Cardano.Ledger.Conformance.Spec.Base as SpecBase
 import qualified Test.Cardano.Ledger.Conformance.Spec.Conway as SpecConway
+import qualified Test.Cardano.Ledger.Conformance.Spec.Dijkstra.Foreign as SpecForeign
+import qualified Test.Cardano.Ledger.Conformance.Spec.Dijkstra.Receiving as SpecReceiving
 
 main :: IO ()
 main =
@@ -15,4 +17,6 @@ main =
         SpecConway.spec
         ImpConway.spec
       describe "Dijkstra" $ do
+        SpecForeign.spec
+        SpecReceiving.spec
         ImpDijkstra.spec

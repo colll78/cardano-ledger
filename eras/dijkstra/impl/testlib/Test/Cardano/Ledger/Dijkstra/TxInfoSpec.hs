@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedLists #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -13,14 +14,17 @@ import Cardano.Ledger.Alonzo.Plutus.Context (
   EraPlutusContext (..),
   EraPlutusTxInfo (..),
   LedgerLevelTxInfo (..),
+  LedgerTxInfo (..),
   PlutusTxInfoResult (..),
   SupportedLanguage (..),
   toPlutusTxInfoForPurpose,
  )
+import qualified Cardano.Ledger.Alonzo.Plutus.TxInfo as Alonzo
 import Cardano.Ledger.Alonzo.Scripts (AsPurpose (..), toAsPurpose)
 import Cardano.Ledger.Alonzo.TxWits (unRedeemersL)
 import Cardano.Ledger.Alonzo.UTxO
 import Cardano.Ledger.Babbage.TxInfo (BabbageContextError (..))
+import qualified Cardano.Ledger.Babbage.TxInfo as Babbage
 import Cardano.Ledger.BaseTypes (
   Globals (..),
   Inject (..),
@@ -28,17 +32,26 @@ import Cardano.Ledger.BaseTypes (
   ProtVer (..),
   TxIx (..),
  )
+import Cardano.Ledger.Binary (serialize)
 import Cardano.Ledger.Credential (Credential (..), StakeReference (..))
 import Cardano.Ledger.Dijkstra.Core
 import Cardano.Ledger.Dijkstra.Scripts (
   AccountBalanceIntervals (..),
+  DijkstraEraScript,
  )
 import Cardano.Ledger.Dijkstra.State (UTxO (..))
-import Cardano.Ledger.Dijkstra.TxInfo (DijkstraContextError (..))
+import Cardano.Ledger.Dijkstra.TxBody (receivingScriptTargets)
+import Cardano.Ledger.Dijkstra.TxInfo (DijkstraContextError (..), transTxRedeemersV4)
 import Cardano.Ledger.Plutus (
+  Data (..),
+  Datum (..),
+  ExUnits (..),
   Language (..),
+  PlutusArgs (..),
   SLanguage (..),
   TxOutSource (..),
+  assocMapToList,
+  dataToBinaryData,
   getPlutusData,
   hashPlutusScript,
   plutusLanguage,
@@ -48,19 +61,23 @@ import Cardano.Ledger.Plutus (
   transScriptHash,
   transTxIx,
  )
+import Cardano.Ledger.Shelley.Scripts (pattern RequireAllOf)
 import Cardano.Ledger.State (EraUTxO (..))
 import Cardano.Ledger.TxIn (TxId (..), TxIn (..))
 import qualified Cardano.Ledger.Val as Val
 import Control.Monad.Trans.Fail.String (errorFail)
+import Data.Either (isLeft, isRight)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.NonEmpty as NEM
 import qualified Data.Map.Strict as Map
 import qualified Data.OSet.Strict as OSet
 import Data.Proxy (Proxy (..))
+import Data.Word (Word32)
 import Lens.Micro ((&), (.~))
+import qualified PlutusLedgerApi.V1 as P
 import qualified PlutusLedgerApi.V4 as PV4
 import Test.Cardano.Ledger.Alonzo.Era (mkTestLedgerTxInfo)
-import Test.Cardano.Ledger.Common
+import Test.Cardano.Ledger.Common hiding (context, output)
 import Test.Cardano.Ledger.Core.Utils (testGlobals)
 import Test.Cardano.Ledger.Dijkstra.Arbitrary ()
 import qualified Test.Cardano.Ledger.Plutus.Examples as Plutus
@@ -73,7 +90,9 @@ spec ::
   , EraPlutusTxInfo PlutusV4 era
   , Inject (DijkstraContextError era) (ContextError era)
   , Inject (BabbageContextError era) (ContextError era)
+  , Inject (Alonzo.AlonzoContextError era) (ContextError era)
   , DijkstraEraTxBody era
+  , DijkstraEraScript era
   , EraUTxO era
   , Arbitrary (Value era)
   , AlonzoEraTxWits era
@@ -85,7 +104,354 @@ spec = describe "TxInfo" $ do
         let ei = epochInfo testGlobals
             ss = systemStart testGlobals
          in mkTestLedgerTxInfo (ProtVer (eraProtVerLow @era) 0) ei ss utxo tx
+  prop "legacy missing-input error order is unchanged without protected addresses" $ do
+    first <- arbitrary
+    second <- arbitrary `suchThat` (/= first)
+    let input = max first second
+        referenceInput = min first second
+        tx =
+          mkBasicTx @era @TopTx $
+            mkBasicTxBody
+              & inputsTxBodyL .~ [input]
+              & referenceInputsTxBodyL .~ [referenceInput]
+        lti = mkLocalLedgerTxInfo mempty tx $ LedgerTopTxInfo mempty
+        expected = inject $ Alonzo.TranslationLogicMissingInput @era input
+    pure $ do
+      toPlutusTxInfoForPurpose SPlutusV1 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+      toPlutusTxInfoForPurpose SPlutusV2 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+      toPlutusTxInfoForPurpose SPlutusV3 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+  prop "V1-V3 reject the Receiving purpose explicitly" $ do
+    outputIndex <- arbitrary
+    let tx = mkBasicTx @era @TopTx mkBasicTxBody
+        lti = mkLocalLedgerTxInfo mempty tx $ LedgerTopTxInfo mempty
+        purpose = ReceivingPurpose $ AsIxItem outputIndex outputIndex
+        expected = inject $ Alonzo.PlutusPurposeNotSupported @era (ReceivingPurpose $ AsItem outputIndex)
+    pure $ do
+      toPlutusScriptPurpose SPlutusV1 lti purpose `shouldBeLeft` expected
+      toPlutusScriptPurpose SPlutusV2 lti purpose `shouldBeLeft` expected
+      toPlutusScriptPurpose SPlutusV3 lti purpose `shouldBeLeft` expected
+  describe "protected addresses" $ do
+    prop "V4 preserves protection and accounts in outputs, inputs and reference inputs" $ do
+      paymentCred <- arbitrary
+      accountCred <- arbitrary
+      val <- arbitrary
+      input <- arbitrary
+      referenceInput <- arbitrary `suchThat` (/= input)
+      let output = mkBasicTxOut (AddrProtected Testnet paymentCred (StakeRefBase accountCred)) val
+          utxo = UTxO [(input, output), (referenceInput, output)]
+          tx =
+            mkBasicTx @era @TopTx $
+              mkBasicTxBody
+                & inputsTxBodyL .~ [input]
+                & referenceInputsTxBodyL .~ [referenceInput]
+                & outputsTxBodyL .~ [output]
+          lti = mkLocalLedgerTxInfo utxo tx $ LedgerTopTxInfo mempty
+          expected = PV4.AddressProtected (transCred paymentCred) (Just $ PV4.AccountId $ transCred accountCred)
+      pure $ case toPlutusTxInfoForPurpose SPlutusV4 lti (SpendingPurpose AsPurpose) of
+        Right info -> do
+          map PV4.txOutAddress (PV4.txInfoOutputs info) `shouldBe` [expected]
+          map (PV4.txOutAddress . PV4.txInInfoResolved) (PV4.txInfoInputs info) `shouldBe` [expected]
+          map (PV4.txOutAddress . PV4.txInInfoResolved) (PV4.txInfoReferenceInputs info) `shouldBe` [expected]
+        Left err -> expectationFailure $ "Failed to translate protected V4 context: " <> show err
+    prop "V1-V3 reject protected outputs even with a key payment credential" $ do
+      keyHash <- arbitrary
+      val <- arbitrary
+      let output = mkBasicTxOut (AddrProtected Testnet (KeyHashObj keyHash) StakeRefNull) val
+          tx = mkBasicTx @era @TopTx $ mkBasicTxBody & outputsTxBodyL .~ [output]
+          lti = mkLocalLedgerTxInfo mempty tx $ LedgerTopTxInfo mempty
+          expected = inject $ ProtectedAddressNotSupported @era (TxOutFromOutput $ TxIx 0)
+      pure $ do
+        toPlutusTxInfoForPurpose SPlutusV1 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+        toPlutusTxInfoForPurpose SPlutusV2 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+        toPlutusTxInfoForPurpose SPlutusV3 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+    prop "V1 hides protected references; V1-V3 reject protected consumed inputs" $ do
+      paymentCred <- arbitrary
+      val <- arbitrary
+      referenceInput <- arbitrary
+      let output = mkBasicTxOut (AddrProtected Testnet paymentCred StakeRefNull) val
+          utxo = UTxO [(referenceInput, output)]
+          tx = mkBasicTx @era @TopTx $ mkBasicTxBody & referenceInputsTxBodyL .~ [referenceInput]
+          lti = mkLocalLedgerTxInfo utxo tx $ LedgerTopTxInfo mempty
+          inputTx = mkBasicTx @era @TopTx $ mkBasicTxBody & inputsTxBodyL .~ [referenceInput]
+          inputLti = mkLocalLedgerTxInfo utxo inputTx $ LedgerTopTxInfo mempty
+          expected = inject $ ProtectedAddressNotSupported @era (TxOutFromInput referenceInput)
+      pure $ do
+        toPlutusTxInfoForPurpose SPlutusV1 lti (SpendingPurpose AsPurpose) `shouldSatisfy` isRight
+        toPlutusTxInfoForPurpose SPlutusV2 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+        toPlutusTxInfoForPurpose SPlutusV3 lti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+        toPlutusTxInfoForPurpose SPlutusV1 inputLti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+        toPlutusTxInfoForPurpose SPlutusV2 inputLti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+        toPlutusTxInfoForPurpose SPlutusV3 inputLti (SpendingPurpose AsPurpose) `shouldBeLeft` expected
+    prop "ordinary references without an inline datum remain supported by V1-V3" $ do
+      paymentCred <- arbitrary
+      val <- arbitrary
+      input <- arbitrary
+      let output = mkBasicTxOut (Addr Testnet paymentCred StakeRefNull) val
+          utxo = UTxO [(input, output)]
+          tx = mkBasicTx @era @TopTx $ mkBasicTxBody & referenceInputsTxBodyL .~ [input]
+          lti = mkLocalLedgerTxInfo utxo tx $ LedgerTopTxInfo mempty
+      pure $ do
+        toPlutusTxInfoForPurpose SPlutusV1 lti (SpendingPurpose AsPurpose) `shouldSatisfy` isRight
+        toPlutusTxInfoForPurpose SPlutusV2 lti (SpendingPurpose AsPurpose) `shouldSatisfy` isRight
+        toPlutusTxInfoForPurpose SPlutusV3 lti (SpendingPurpose AsPurpose) `shouldSatisfy` isRight
+    prop "V1 preserves hidden-reference missing, Byron and inline-datum errors" $ do
+      paymentCred <- arbitrary
+      bootstrap <- arbitrary
+      val <- arbitrary
+      input <- arbitrary
+      datum <- arbitrary
+      let ordinary = mkBasicTxOut (Addr Testnet paymentCred StakeRefNull) val
+          protected = mkBasicTxOut (AddrProtected Testnet paymentCred StakeRefNull) val
+          byron = mkBasicTxOut (AddrBootstrap bootstrap) val
+          inline output = output & datumTxOutL .~ Datum (dataToBinaryData datum)
+          tx = mkBasicTx @era @TopTx $ mkBasicTxBody & referenceInputsTxBodyL .~ [input]
+          translate utxo =
+            toPlutusTxInfoForPurpose
+              SPlutusV1
+              (mkLocalLedgerTxInfo utxo tx $ LedgerTopTxInfo mempty)
+              (SpendingPurpose AsPurpose)
+          source = TxOutFromInput input
+      pure $ do
+        translate mempty `shouldBeLeft` inject (Alonzo.TranslationLogicMissingInput @era input)
+        translate (UTxO [(input, byron)]) `shouldBeLeft` inject (ByronTxOutInContext @era source)
+        forM_ ([ordinary, protected, byron] :: [TxOut era]) $ \output ->
+          translate (UTxO [(input, inline output)])
+            `shouldBeLeft` inject (InlineDatumsNotSupported @era source)
+    prop "legacy top contexts do not reject protected outputs visible only to a child" $ do
+      paymentCred <- arbitrary
+      val <- arbitrary
+      let output = mkBasicTxOut (AddrProtected Testnet paymentCred StakeRefNull) val
+          sub = mkBasicTx @era @SubTx $ mkBasicTxBody & outputsTxBodyL .~ [output]
+          tx = mkBasicTx @era @TopTx $ mkBasicTxBody & subTransactionsTxBodyL .~ [sub]
+          lti = mkLocalLedgerTxInfo mempty tx $ LedgerTopTxInfo mempty
+      pure $ do
+        toPlutusTxInfoForPurpose SPlutusV1 lti (SpendingPurpose AsPurpose) `shouldSatisfy` isRight
+        toPlutusTxInfoForPurpose SPlutusV2 lti (SpendingPurpose AsPurpose) `shouldSatisfy` isRight
+        toPlutusTxInfoForPurpose SPlutusV3 lti (SpendingPurpose AsPurpose) `shouldSatisfy` isRight
   describe "PlutusV4" $ do
+    prop "shared Receiving translation matches pointer inversion for mixed targets and errors" $ do
+      val <- arbitrary
+      redeemer <- arbitrary
+      exUnits <- arbitrary
+      input <- arbitrary
+      keyHash <- arbitrary
+      let firstPlutus = Plutus.alwaysSucceedsNoDatum SPlutusV4
+          secondPlutus = Plutus.inputsOutputsAreNotEmptyNoDatum SPlutusV4
+          firstHash = hashPlutusScript firstPlutus
+          secondHash = hashPlutusScript secondPlutus
+          firstScript = fromPlutusScript $ errorFail $ mkPlutusScript firstPlutus
+          secondScript = fromPlutusScript $ errorFail $ mkPlutusScript secondPlutus
+          nativeScript = fromNativeScript @era (RequireAllOf [])
+          nativeHash = hashScript nativeScript
+      unavailableHash <-
+        arbitrary `suchThat` (`notElem` ([firstHash, secondHash, nativeHash] :: [ScriptHash]))
+      let protected hash = mkBasicTxOut (AddrProtected Testnet (ScriptHashObj hash) StakeRefNull) val
+          body =
+            mkBasicTxBody
+              & inputsTxBodyL .~ [input]
+              & guardsTxBodyL .~ [ScriptHashObj firstHash]
+              & outputsTxBodyL
+                .~ [ protected firstHash
+                   , protected nativeHash
+                   , protected unavailableHash
+                   , protected secondHash
+                   , protected firstHash
+                   , mkBasicTxOut (Addr Testnet (ScriptHashObj firstHash) StakeRefNull) val
+                   , mkBasicTxOut (AddrProtected Testnet (KeyHashObj keyHash) StakeRefNull) val
+                   ]
+          targets = receivingScriptTargets body
+          receivingPtr outputIndex = ReceivingPurpose (AsIx outputIndex)
+          redeemers =
+            Map.fromList
+              [ (SpendingPurpose $ AsIx 0, (redeemer, exUnits))
+              , (GuardingPurpose $ AsIx 0, (redeemer, exUnits))
+              , (receivingPtr 0, (redeemer, exUnits))
+              , (receivingPtr 3, (redeemer, exUnits))
+              , (receivingPtr 4, (redeemer, exUnits))
+              ]
+          tx =
+            mkBasicTx @era @TopTx body
+              & witsTxL . scriptTxWitsL
+                .~ Map.fromList [(firstHash, firstScript), (secondHash, secondScript), (nativeHash, nativeScript)]
+              & witsTxL . rdmrsTxWitsL . unRedeemersL .~ redeemers
+          utxo = UTxO [(input, mkBasicTxOut (Addr Testnet (ScriptHashObj firstHash) StakeRefNull) val)]
+          lti = mkLocalLedgerTxInfo utxo tx $ LedgerTopTxInfo mempty
+          compareTranslators info =
+            transTxRedeemersV4 info `shouldBe` Babbage.transTxRedeemers SPlutusV4 info
+          withPointer ptr =
+            mkLocalLedgerTxInfo
+              utxo
+              (tx & witsTxL . rdmrsTxWitsL . unRedeemersL .~ Map.singleton ptr (redeemer, exUnits))
+              (LedgerTopTxInfo mempty)
+          unknownReceiving = ReceivingPurpose $ AsIx 7
+      pure $ do
+        targets
+          `shouldBe` [(0, firstHash), (1, nativeHash), (2, unavailableHash), (3, secondHash), (4, firstHash)]
+        Map.size (ltiScriptHashesUsed lti) `shouldBe` 5
+        compareTranslators lti
+        case transTxRedeemersV4 lti of
+          Left err -> expectationFailure $ "Mixed-purpose translation failed: " <> show err
+          Right translated -> do
+            length (assocMapToList translated) `shouldBe` 5
+            map fst (assocMapToList translated)
+              `shouldSatisfy` elem (PV4.Receiving (transScriptHash firstHash) 0)
+            map fst (assocMapToList translated)
+              `shouldSatisfy` elem (PV4.Receiving (transScriptHash firstHash) 4)
+        forM_
+          ( [ receivingPtr 1
+            , receivingPtr 2
+            , receivingPtr 5
+            , receivingPtr 6
+            , unknownReceiving
+            , SpendingPurpose $ AsIx 1
+            , GuardingPurpose $ AsIx 1
+            ] ::
+              [PlutusPurpose AsIx era]
+          )
+          $ \ptr -> do
+            compareTranslators (withPointer ptr)
+            transTxRedeemersV4 (withPointer ptr) `shouldSatisfy` isLeft
+        transTxRedeemersV4 (withPointer unknownReceiving)
+          `shouldBeLeft` inject (RedeemerPointerPointsToNothing @era unknownReceiving)
+    prop "Receiving contexts distinguish differing and byte-identical outputs at their raw positions" $ do
+      val <- arbitrary
+      accountCred <- arbitrary
+      let plutusScript = Plutus.alwaysSucceedsNoDatum SPlutusV4
+          scriptHash = hashPlutusScript plutusScript
+          script = errorFail $ mkPlutusScript plutusScript
+          firstOutput = mkBasicTxOut (AddrProtected Testnet (ScriptHashObj scriptHash) StakeRefNull) val
+          otherOutput =
+            mkBasicTxOut (AddrProtected Testnet (ScriptHashObj scriptHash) (StakeRefBase accountCred)) val
+              & datumTxOutL .~ Datum (dataToBinaryData (Data @era (P.I 4)))
+          ordinary = mkBasicTxOut (Addr Testnet (ScriptHashObj scriptHash) StakeRefNull) val
+          firstRedeemer = Data @era (P.I 2)
+          secondRedeemer = Data @era (P.I 4)
+      pure $ forM_ ([False, True] :: [Bool]) $ \identical -> do
+        let secondOutput = if identical then firstOutput else otherOutput
+            redeemers =
+              Map.fromList
+                [ (ReceivingPurpose (AsIx 1), (firstRedeemer, ExUnits 1 10))
+                , (ReceivingPurpose (AsIx 3), (secondRedeemer, ExUnits 2 20))
+                ]
+            tx =
+              mkBasicTx @era @TopTx
+                (mkBasicTxBody & outputsTxBodyL .~ [ordinary, firstOutput, ordinary, secondOutput])
+                & witsTxL . rdmrsTxWitsL . unRedeemersL .~ redeemers
+                & witsTxL . scriptTxWitsL .~ Map.singleton scriptHash (fromPlutusScript script)
+            lti = mkLocalLedgerTxInfo mempty tx $ LedgerTopTxInfo mempty
+        if identical
+          then
+            serialize (eraProtVerLow @era) firstOutput `shouldBe` serialize (eraProtVerLow @era) secondOutput
+          else firstOutput `shouldNotBe` secondOutput
+        case unPlutusTxInfoResult (toPlutusTxInfo SPlutusV4 lti) of
+          Left err -> expectationFailure $ "Failed to translate per-output Receiving info: " <> show err
+          Right info -> do
+            map fst (assocMapToList (PV4.txInfoRedeemers info))
+              `shouldMatchList` [PV4.Receiving (transScriptHash scriptHash) 1, PV4.Receiving (transScriptHash scriptHash) 3]
+            map fst (PV4.protectedOutputsAt (transScriptHash scriptHash) info) `shouldBe` [1, 3]
+            case PV4.txInfoOutputs info of
+              [_, firstResolved, _, secondResolved] ->
+                forM_
+                  ( [(1, firstResolved, firstRedeemer), (3, secondResolved, secondRedeemer)] ::
+                      [(Word32, PV4.TxOut, Data era)]
+                  )
+                  $ \(outputIndex, resolvedOutput, redeemer) -> do
+                    let purpose = ReceivingPurpose (AsIxItem outputIndex outputIndex)
+                    toPlutusScriptPurpose SPlutusV4 lti purpose
+                      `shouldBe` Right (PV4.Receiving (transScriptHash scriptHash) (toInteger outputIndex))
+                    case toPlutusArgs SPlutusV4 lti info purpose redeemer of
+                      Left err -> expectationFailure $ "Failed to translate per-output Receiving args: " <> show err
+                      Right (PlutusV4Args v4Context) -> do
+                        PV4.scriptContextScriptInfo v4Context
+                          `shouldBe` PV4.ReceivingScript (toInteger outputIndex) resolvedOutput
+                        PV4.scriptContextScriptHash v4Context `shouldBe` transScriptHash scriptHash
+                        PV4.scriptContextRedeemer v4Context
+                          `shouldBe` PV4.Redeemer (PV4.dataToBuiltinData $ getPlutusData redeemer)
+              _ -> expectationFailure "Receiving context changed the authored ordinary output positions"
+    prop "parent and child Receiving index zero resolve only their own output and redeemer" $ do
+      val <- arbitrary
+      let plutus = Plutus.alwaysSucceedsNoDatum SPlutusV4
+          scriptHash = hashPlutusScript plutus
+          script = fromPlutusScript $ errorFail $ mkPlutusScript plutus
+          output datum =
+            mkBasicTxOut (AddrProtected Testnet (ScriptHashObj scriptHash) StakeRefNull) val
+              & datumTxOutL .~ Datum (dataToBinaryData datum)
+          parentRedeemer = Data @era (P.I 2)
+          childRedeemer = Data @era (P.I 4)
+          child =
+            mkBasicTx @era @SubTx (mkBasicTxBody & outputsTxBodyL .~ [output childRedeemer])
+              & witsTxL . rdmrsTxWitsL . unRedeemersL
+                .~ Map.singleton (ReceivingPurpose (AsIx 0)) (childRedeemer, ExUnits 2 20)
+              & witsTxL . scriptTxWitsL .~ Map.singleton scriptHash script
+          childLti = mkLocalLedgerTxInfo mempty child $ LedgerSubTxInfo (TxIx 0)
+          parent =
+            mkBasicTx @era @TopTx
+              (mkBasicTxBody & outputsTxBodyL .~ [output parentRedeemer] & subTransactionsTxBodyL .~ [child])
+              & witsTxL . rdmrsTxWitsL . unRedeemersL
+                .~ Map.singleton (ReceivingPurpose (AsIx 0)) (parentRedeemer, ExUnits 1 10)
+              & witsTxL . scriptTxWitsL .~ Map.singleton scriptHash script
+          parentLti =
+            mkLocalLedgerTxInfo mempty parent $
+              LedgerTopTxInfo $
+                Map.singleton (txIdTx child) (mkTxInfoResult childLti)
+          purpose = ReceivingPurpose (AsIxItem 0 0)
+      pure $ case ( unPlutusTxInfoResult (toPlutusTxInfo SPlutusV4 parentLti)
+                  , unPlutusTxInfoResult (toPlutusTxInfo SPlutusV4 childLti)
+                  ) of
+        (Right parentInfo, Right childInfo) ->
+          case ( toPlutusArgs SPlutusV4 parentLti parentInfo purpose parentRedeemer
+               , toPlutusArgs SPlutusV4 childLti childInfo purpose childRedeemer
+               ) of
+            (Right (PlutusV4Args parentContext), Right (PlutusV4Args childContext)) ->
+              case (PV4.txInfoOutputs parentInfo, PV4.txInfoOutputs childInfo) of
+                ([parentOutput], [childOutput]) -> do
+                  parentOutput `shouldNotBe` childOutput
+                  PV4.scriptContextScriptInfo parentContext `shouldBe` PV4.ReceivingScript 0 parentOutput
+                  PV4.scriptContextScriptInfo childContext `shouldBe` PV4.ReceivingScript 0 childOutput
+                  PV4.scriptContextRedeemer parentContext
+                    `shouldBe` PV4.Redeemer (PV4.dataToBuiltinData $ getPlutusData parentRedeemer)
+                  PV4.scriptContextRedeemer childContext
+                    `shouldBe` PV4.Redeemer (PV4.dataToBuiltinData $ getPlutusData childRedeemer)
+                  PV4.txInfoSubTxIx parentInfo `shouldBe` Nothing
+                  PV4.txInfoSubTxIx childInfo `shouldBe` Just (transTxIx (TxIx 0))
+                _ -> expectationFailure "Parent or child Receiving context includes outputs from another body"
+            _ -> expectationFailure "Parent or child Receiving argument translation failed"
+        _ -> expectationFailure "Parent or child Receiving TxInfo translation failed"
+    prop "top-level Guarding preserves child protected outputs and Receiving hashes" $ do
+      val <- arbitrary
+      redeemer <- arbitrary
+      exUnits <- arbitrary
+      let plutusScript = Plutus.alwaysSucceedsNoDatum SPlutusV4
+          scriptHash = hashPlutusScript plutusScript
+          script = errorFail $ mkPlutusScript plutusScript
+          output = mkBasicTxOut (AddrProtected Testnet (ScriptHashObj scriptHash) StakeRefNull) val
+          sub =
+            mkBasicTx @era @SubTx (mkBasicTxBody & outputsTxBodyL .~ [output])
+              & witsTxL . rdmrsTxWitsL . unRedeemersL
+                .~ Map.singleton (ReceivingPurpose $ AsIx 0) (redeemer, exUnits)
+              & witsTxL . scriptTxWitsL .~ Map.singleton scriptHash (fromPlutusScript script)
+          subLti = mkLocalLedgerTxInfo mempty sub $ LedgerSubTxInfo (TxIx 0)
+          tx =
+            mkBasicTx @era @TopTx
+              (mkBasicTxBody & subTransactionsTxBodyL .~ [sub] & guardsTxBodyL .~ [ScriptHashObj scriptHash])
+              & witsTxL . rdmrsTxWitsL . unRedeemersL
+                .~ Map.singleton (GuardingPurpose $ AsIx 0) (redeemer, exUnits)
+              & witsTxL . scriptTxWitsL .~ Map.singleton scriptHash (fromPlutusScript script)
+          lti =
+            mkLocalLedgerTxInfo mempty tx $ LedgerTopTxInfo $ Map.singleton (txIdTx sub) (mkTxInfoResult subLti)
+          purpose = GuardingPurpose $ AsIxItem 0 scriptHash
+          expected = PV4.AddressProtected (transCred $ ScriptHashObj scriptHash) Nothing
+      pure $ case unPlutusTxInfoResult (toPlutusTxInfo SPlutusV4 lti) of
+        Left err -> expectationFailure $ "Failed to translate Guarding info: " <> show err
+        Right info -> case toPlutusArgs SPlutusV4 lti info purpose redeemer of
+          Left err -> expectationFailure $ "Failed to translate Guarding args: " <> show err
+          Right (PlutusV4Args context) -> case PV4.scriptContextScriptInfo context of
+            PV4.GuardingScript _ (Just topInfo) -> do
+              map PV4.txOutAddress (PV4.ttisOutputs $ PV4.topTxInfoSimplified topInfo) `shouldBe` [expected]
+              map (map PV4.txOutAddress . PV4.txInfoOutputs) (PV4.topTxInfoSubTransactions topInfo)
+                `shouldBe` [[expected]]
+              PV4.ttisRedeemerHashes (PV4.topTxInfoSimplified topInfo) `shouldBe` [transScriptHash scriptHash]
+            _ -> expectationFailure "Top-level Guarding has no full batch view"
     prop "Threads the sub-transaction index into txInfoSubTxIx" $ \(txIx :: TxIx) -> do
       let
         tx = mkBasicTx @era @SubTx mkBasicTxBody

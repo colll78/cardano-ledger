@@ -2,10 +2,24 @@
 
 ## 0.5.0.0
 
+* Remove `InjectRuleFailure "SUBUTXO" DijkstraUtxoPredFailure DijkstraEra`; add `dijkstraUtxoToDijkstraSubUtxoPredFailure`, which returns `Nothing` for top-only failures
+* Remove `InjectRuleFailure "ENTITIES" ShelleyUtxoPredFailure DijkstraEra` and `InjectRuleFailure "SUBENTITIES" ShelleyUtxoPredFailure DijkstraEra`; validate withdrawal networks directly with each rule's own failure constructor
+* Add `DijkstraReceiving` with redeemer tag 7 and original body-local output indices in both `AsItem` and `AsIx`
+* Add `receivingScriptTargets` and `transTxRedeemersV4` to preserve one Receiving execution per protected Plutus output, including repeated script hashes and raw output-index gaps
+* Require body-local key, native-script and Plutus witnesses for protected outputs
+* Translate protected addresses and Receiving purposes into the receiving-aware Plutus V4 context, including the original output index and its resolved output in `ReceivingScript`
+* Add `UnsupportedOutputAddresses`, `ProtectedCollateralReturn` and `SubUnsupportedOutputAddresses` predicate failures
+* Add `evalDijkstraTxExUnits` and `evalDijkstraTxExUnitsWithLogs` for body-local batch redeemer reports
 * Add `kesMaxKeyAgeEpochs` to compute how many epochs a registered Leios voting key (CIP-0164) stays valid from the KES parameters
 * Change `seatInitialLeiosCommittee` to accept a `TransitionConfig` and also seat the Leios voting committee (CIP-0164) in the set and go snapshots
 * Add `Embed (SNAP era) (TICKF era)` instance, so that `TICKF` runs the Dijkstra `SNAP` rule
 * Change `eraMaxLanguage` to `PlutusV4`
+
+### `testlib`
+
+* Check complete Dijkstra genesis JSON roundtrips and reject malformed initial V4 cost-model lengths
+* Generate and shrink protected addresses while retaining protection and valid address forms
+* Add Receiving witness, redeemer and datum fixups for top-level and child transactions, retaining each output invocation's budget and aggregating execution units across the batch
 
 ## 0.4.0.0
 

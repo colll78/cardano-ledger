@@ -5,7 +5,7 @@ module Cardano.Ledger.Plutus.Preprocessor.Source.V4 where
 
 import Language.Haskell.TH
 import qualified PlutusLedgerApi.Data.V4 as PV4D
-import PlutusTx (fromBuiltinData, unsafeFromBuiltinData)
+import PlutusTx (fromBuiltinData, toBuiltinData, unsafeFromBuiltinData)
 import qualified PlutusTx.Builtins as P
 import qualified PlutusTx.Data.AssocMap as PAMD
 import qualified PlutusTx.Data.List as PLD
@@ -141,10 +141,18 @@ purposeIsWellformedNoDatumQ =
               , PV4D.txInfoWithdrawals = infoWithdrawals
               , PV4D.txInfoGuards = infoGuards
               , PV4D.txInfoSubTxIx = infoSubTxIx
+              , PV4D.txInfoOutputs = infoOutputs
               }
             _redeemer
             scriptInfo
             sh -> case scriptInfo of
+              PV4D.ReceivingScript ix output ->
+                ix
+                  P.>= 0
+                  P.&& (toBuiltinData output P.== toBuiltinData (infoOutputs PLD.!! ix))
+                  P.&& case PV4D.txOutAddress output of
+                    PV4D.AddressProtected (PV4D.ScriptCredential recipient) _ -> recipient P.== sh
+                    _ -> False
               PV4D.MintingScript cs ->
                 PAMD.member cs $ PV4D.getValue $ PV4D.mintValueMinted infoMint
               -- Expecting No Datum, therefore should fail when it is supplied
@@ -252,4 +260,50 @@ ensureTreasuryReserveQ =
                   Just treasury -> treasury P.- totalWithdrawal P.>= 100_000_000
                   _ -> False
           _ -> False
+    |]
+
+-- | The same validator authorizes creation and later spending. Receiving checks
+-- its resolved output only; no datum is supplied implicitly.
+receivingEvenDatumQ :: Q [Dec]
+receivingEvenDatumQ =
+  [d|
+    receivingEvenDatum :: P.BuiltinData -> P.BuiltinUnit
+    receivingEvenDatum arg =
+      let PV4D.ScriptContext _txInfo _redeemer scriptInfo _scriptHash = unsafeFromBuiltinData arg
+          evenDatum datum = case fromBuiltinData datum of
+            Just i -> P.modInteger i 2 P.== 0
+            Nothing -> False
+          validOutput output = case PV4D.txOutDatum output of
+            PV4D.OutputDatum (PV4D.Datum datum) -> evenDatum datum
+            _ -> False
+       in P.check $ case scriptInfo of
+            PV4D.ReceivingScript _index output -> validOutput output
+            PV4D.SpendingScript _ (Just (PV4D.Datum datum)) -> evenDatum datum
+            _ -> False
+    |]
+
+-- | Bind this execution's redeemer to its inline integer datum and verify that
+-- the resolved output occupies the supplied original body index.
+receivingRedeemerMatchesDatumQ :: Q [Dec]
+receivingRedeemerMatchesDatumQ =
+  [d|
+    receivingRedeemerMatchesDatum :: P.BuiltinData -> P.BuiltinUnit
+    receivingRedeemerMatchesDatum arg =
+      let PV4D.ScriptContext txInfo (PV4D.Redeemer redeemer) scriptInfo scriptHash = unsafeFromBuiltinData arg
+       in P.check $ case scriptInfo of
+            PV4D.ReceivingScript index output ->
+              index
+                P.>= 0
+                P.&& (toBuiltinData output P.== toBuiltinData (PV4D.txInfoOutputs txInfo PLD.!! index))
+                P.&& ( case PV4D.txOutAddress output of
+                         PV4D.AddressProtected (PV4D.ScriptCredential recipient) _ -> recipient P.== scriptHash
+                         _ -> False
+                     )
+                P.&& case PV4D.txOutDatum output of
+                  PV4D.OutputDatum (PV4D.Datum datum) ->
+                    case (fromBuiltinData datum, fromBuiltinData redeemer) of
+                      (Just actual, Just expected) -> P.equalsInteger actual expected
+                      _ -> False
+                  _ -> False
+            _ -> False
     |]

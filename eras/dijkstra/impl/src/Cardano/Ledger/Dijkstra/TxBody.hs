@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
@@ -101,10 +102,13 @@ module Cardano.Ledger.Dijkstra.TxBody (
   accountBalanceIntervalsDijkstraTxBodyRawL,
   startingAccountBalanceIntervalsDijkstraTxBodyRawL,
   dijkstraAllInputsTxBodyF,
+  receivingScriptHashes,
+  receivingScriptTargets,
+  receivingKeyHashes,
 ) where
 
 import Cardano.Base.Typeable (TypeName (TypeName))
-import Cardano.Ledger.Address (DirectDeposits (..))
+import Cardano.Ledger.Address (AddressProtection (..), DirectDeposits (..), shelleyAddressView)
 import Cardano.Ledger.Allegra.Scripts (invalidBeforeL, invalidHereAfterL)
 import Cardano.Ledger.Alonzo.TxBody (Indexable (..), alonzoSpendableInputsTxBodyF)
 import Cardano.Ledger.Babbage.TxBody (
@@ -165,6 +169,7 @@ import qualified Data.Sequence.Strict as StrictSeq
 import Data.Set (Set, foldr')
 import qualified Data.Set as Set
 import Data.Typeable (Typeable, typeRep)
+import Data.Word (Word32)
 import GHC.Generics (Generic)
 import Lens.Micro (Lens', SimpleGetter, lens, to, (.~), (^.))
 import NoThunks.Class (InspectHeap (..), NoThunks)
@@ -1258,6 +1263,46 @@ dijkstraTotalDepositsTxBody pp isPoolRegisted txBody =
   getTotalDepositsTxCerts pp isPoolRegisted (txBody ^. certsTxBodyL)
     <+> conwayProposalsDeposits pp txBody
 
+-- | Unique protected payment script hashes for the shared script pool. This set
+-- does not identify Receiving executions, which are distinct for every output.
+receivingScriptHashes :: EraTxBody era => TxBody l era -> Set ScriptHash
+receivingScriptHashes = snd . receivingCredentials
+
+-- | Receiving targets in original body-local output order. Enumerate all ordinary
+-- outputs before filtering, preserving gaps and repeated script hashes. Collateral
+-- returns and child bodies are excluded. Transaction size limits bound the number
+-- of outputs well below the Word32 index bound.
+receivingScriptTargets :: EraTxBody era => TxBody l era -> [(Word32, ScriptHash)]
+receivingScriptTargets txBody =
+  [ (ix, scriptHash)
+  | (ix, txOut) <- zip [0 ..] (Foldable.toList (txBody ^. outputsTxBodyL))
+  , Just scriptHash <- [protectedPaymentScriptHash txOut]
+  ]
+
+protectedPaymentScriptHash :: EraTxOut era => TxOut era -> Maybe ScriptHash
+protectedPaymentScriptHash txOut =
+  case shelleyAddressView (txOut ^. addrTxOutL) of
+    Just (Protected, _, ScriptHashObj scriptHash, _) -> Just scriptHash
+    _ -> Nothing
+
+receivingScriptHashAt :: EraTxBody era => TxBody l era -> Word32 -> Maybe ScriptHash
+receivingScriptHashAt txBody ix =
+  StrictSeq.lookup (fromIntegral ix) (txBody ^. outputsTxBodyL) >>= protectedPaymentScriptHash
+
+-- | Payment signatures required to create this body's protected outputs.
+receivingKeyHashes :: EraTxBody era => TxBody l era -> Set (KeyHash Payment)
+receivingKeyHashes = fst . receivingCredentials
+
+receivingCredentials ::
+  EraTxBody era => TxBody l era -> (Set (KeyHash Payment), Set ScriptHash)
+receivingCredentials txBody = Foldable.foldl' collect (Set.empty, Set.empty) (txBody ^. outputsTxBodyL)
+  where
+    collect (!keys, !scripts) txOut =
+      case shelleyAddressView (txOut ^. addrTxOutL) of
+        Just (Protected, _, KeyHashObj key, _) -> (Set.insert key keys, scripts)
+        Just (Protected, _, ScriptHashObj script, _) -> (keys, Set.insert script scripts)
+        _ -> (keys, scripts)
+
 -- | This newtype wrapper lets us index into the guards with a ScriptHash. It
 -- will return the index of the credential when using `indexOf` and the `fromIndex`
 -- method returns a `Nothing` if the credential at the index being looked up is
@@ -1294,6 +1339,10 @@ dijkstraRedeemerPointer txBody = \case
   DijkstraGuarding scriptHash ->
     DijkstraGuarding
       <$> indexOf scriptHash (GuardsScriptHashView $ txBody ^. guardsTxBodyL)
+  DijkstraReceiving (AsItem ix) ->
+    case receivingScriptHashAt txBody ix of
+      Nothing -> SNothing
+      Just _ -> SJust $ DijkstraReceiving (AsIx ix)
 
 dijkstraRedeemerPointerInverse ::
   DijkstraEraTxBody era =>
@@ -1315,6 +1364,10 @@ dijkstraRedeemerPointerInverse txBody = \case
     DijkstraProposing <$> fromIndex idx (txBody ^. proposalProceduresTxBodyL)
   DijkstraGuarding idx ->
     DijkstraGuarding <$> fromIndex idx (GuardsScriptHashView $ txBody ^. guardsTxBodyL)
+  DijkstraReceiving (AsIx ix) ->
+    case receivingScriptHashAt txBody ix of
+      Nothing -> SNothing
+      Just _ -> SJust $ DijkstraReceiving (AsIxItem ix ix)
 
 vldtDijkstraTxBodyRawL :: Lens' (DijkstraTxBodyRaw l era) ValidityInterval
 vldtDijkstraTxBodyRawL =
