@@ -128,10 +128,7 @@ instance SpecTranslate DijkstraEra StakePoolSnapShot where
       <*> toSpecRep spssPledge
       <*> (Agda.RewardAddress <$> pure 0 <*> toSpecRep (unAccountId spssAccountId))
       <*> toSpecRep spssVrf
-      <*> traverse
-        ( \BlsKeyState {bksKey = BlsKey {..}, ..} -> (,) (toInteger (bytesToNatural (rawEncodeFixedSized blsPubKey))) <$> toSpecRep bksRegisteredIn
-        )
-        (strictMaybeToMaybe spssBlsKey)
+      <*> toSpecRep spssBlsKey
 
 instance SpecTranslate DijkstraEra Stake where
   type SpecRep DijkstraEra Stake = Agda.HSMap Agda.Credential Agda.Coin

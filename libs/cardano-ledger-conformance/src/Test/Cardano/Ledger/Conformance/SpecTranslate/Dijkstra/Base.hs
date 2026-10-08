@@ -384,6 +384,12 @@ instance SpecTranslate DijkstraEra (AlonzoTxAuxData DijkstraEra) where
 
   toSpecRep = toSpecRep . hashAnnotated
 
+instance SpecTranslate DijkstraEra BlsKeyState where
+  type SpecRep DijkstraEra BlsKeyState = (Integer, Integer)
+
+  toSpecRep BlsKeyState {bksKey = BlsKey {blsPubKey}, bksRegisteredIn} =
+    (,) (toInteger (bytesToNatural (rawEncodeFixedSized blsPubKey))) <$> toSpecRep bksRegisteredIn
+
 instance SpecTranslate DijkstraEra (StakePoolParams DijkstraEra) where
   type SpecRep DijkstraEra (StakePoolParams DijkstraEra) = Agda.StakePoolParams
 

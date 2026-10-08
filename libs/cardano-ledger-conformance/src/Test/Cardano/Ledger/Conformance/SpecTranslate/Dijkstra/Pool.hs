@@ -12,9 +12,7 @@
 
 module Test.Cardano.Ledger.Conformance.SpecTranslate.Dijkstra.Pool () where
 
-import Cardano.Crypto.Util (bytesToNatural)
-import Cardano.Ledger.BaseTypes (Network, strictMaybeToMaybe)
-import Cardano.Ledger.Binary (FixedSizeCodec (..))
+import Cardano.Ledger.BaseTypes (Network)
 import Cardano.Ledger.Compactible (fromCompact)
 import Cardano.Ledger.Core
 import Cardano.Ledger.Dijkstra (DijkstraEra)
@@ -62,11 +60,6 @@ stakePoolStateToSpec ::
 stakePoolStateToSpec netId poolId sps =
   withCtxSpecTransM () $ do
     let StakePoolParams {..} = stakePoolStateToStakePoolParams @DijkstraEra netId poolId sps
-    bls <-
-      traverse
-        ( \BlsKeyState {bksKey = BlsKey {..}, ..} -> (,) (toInteger (bytesToNatural (rawEncodeFixedSized blsPubKey))) <$> toSpecRep bksRegisteredIn
-        )
-        (strictMaybeToMaybe (spsBlsKey sps))
     Agda.StakePoolState
       <$> toSpecRep sppOwners
       <*> toSpecRep sppCost
@@ -74,4 +67,4 @@ stakePoolStateToSpec netId poolId sps =
       <*> toSpecRep sppPledge
       <*> toSpecRep sppAccountAddress
       <*> toSpecRep sppVrf
-      <*> pure bls
+      <*> toSpecRep (spsBlsKey sps)
